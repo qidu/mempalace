@@ -3,7 +3,9 @@ import tempfile
 import shutil
 import yaml
 import chromadb
-from mempalace.miner import mine
+from pathlib import Path
+
+from mempalace.miner import mine, scan_project
 
 
 def test_project_mining():
@@ -34,3 +36,47 @@ def test_project_mining():
     assert col.count() > 0
 
     shutil.rmtree(tmpdir)
+
+
+def test_scan_project_respects_gitignore():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+        os.makedirs(project_root / "src")
+        os.makedirs(project_root / "generated")
+
+        (project_root / ".gitignore").write_text("ignored.py\ngenerated/\n", encoding="utf-8")
+        (project_root / "src" / "app.py").write_text("print('hello')\n" * 20, encoding="utf-8")
+        (project_root / "ignored.py").write_text("print('ignore me')\n" * 20, encoding="utf-8")
+        (project_root / "generated" / "artifact.py").write_text(
+            "print('ignore this dir')\n" * 20,
+            encoding="utf-8",
+        )
+
+        files = scan_project(str(project_root))
+        relative_files = sorted(path.relative_to(project_root).as_posix() for path in files)
+
+        assert relative_files == ["src/app.py"]
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_scan_project_handles_gitignore_negation():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+        os.makedirs(project_root / "generated")
+
+        (project_root / ".gitignore").write_text(
+            "generated/\n!generated/keep.py\n",
+            encoding="utf-8",
+        )
+        (project_root / "generated" / "drop.py").write_text("print('drop')\n" * 20, encoding="utf-8")
+        (project_root / "generated" / "keep.py").write_text("print('keep')\n" * 20, encoding="utf-8")
+
+        files = scan_project(str(project_root))
+        relative_files = sorted(path.relative_to(project_root).as_posix() for path in files)
+
+        assert relative_files == ["generated/keep.py"]
+    finally:
+        shutil.rmtree(tmpdir)

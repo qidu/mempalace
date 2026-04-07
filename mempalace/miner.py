@@ -10,6 +10,7 @@ Stores verbatim chunks as drawers. No summaries. Ever.
 import os
 import sys
 import hashlib
+import fnmatch
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -56,6 +57,122 @@ SKIP_DIRS = {
 CHUNK_SIZE = 800  # chars per drawer
 CHUNK_OVERLAP = 100  # overlap between chunks
 MIN_CHUNK_SIZE = 50  # skip tiny chunks
+
+
+# =============================================================================
+# IGNORE MATCHING
+# =============================================================================
+
+
+class GitignoreMatcher:
+    """Lightweight matcher for a project's root .gitignore patterns."""
+
+    def __init__(self, rules: list):
+        self.rules = rules
+        self.has_negations = any(rule["negated"] for rule in rules)
+
+    @classmethod
+    def from_project(cls, project_path: Path):
+        gitignore_path = project_path / ".gitignore"
+        if not gitignore_path.exists():
+            return cls([])
+
+        try:
+            lines = gitignore_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return cls([])
+
+        rules = []
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            negated = line.startswith("!")
+            if negated:
+                line = line[1:]
+
+            anchored = line.startswith("/")
+            if anchored:
+                line = line.lstrip("/")
+
+            dir_only = line.endswith("/")
+            if dir_only:
+                line = line.rstrip("/")
+
+            if not line:
+                continue
+
+            rules.append(
+                {
+                    "pattern": line,
+                    "anchored": anchored,
+                    "dir_only": dir_only,
+                    "negated": negated,
+                }
+            )
+
+        return cls(rules)
+
+    def matches(self, path: Path, project_path: Path, is_dir: bool = None) -> bool:
+        if not self.rules:
+            return False
+
+        try:
+            relative = path.relative_to(project_path).as_posix().strip("/")
+        except ValueError:
+            return False
+
+        if not relative:
+            return False
+
+        if is_dir is None:
+            is_dir = path.is_dir()
+
+        ignored = False
+        for rule in self.rules:
+            if self._rule_matches(rule, relative, is_dir):
+                ignored = not rule["negated"]
+        return ignored
+
+    def _rule_matches(self, rule: dict, relative: str, is_dir: bool) -> bool:
+        pattern = rule["pattern"]
+        parts = relative.split("/")
+        pattern_parts = pattern.split("/")
+
+        if rule["dir_only"]:
+            target_parts = parts if is_dir else parts[:-1]
+            if not target_parts:
+                return False
+            if rule["anchored"] or len(pattern_parts) > 1:
+                return self._match_from_root(target_parts, pattern_parts)
+            return any(fnmatch.fnmatch(part, pattern) for part in target_parts)
+
+        if rule["anchored"] or len(pattern_parts) > 1:
+            return self._match_from_root(parts, pattern_parts)
+
+        return any(fnmatch.fnmatch(part, pattern) for part in parts)
+
+    def _match_from_root(self, target_parts: list, pattern_parts: list) -> bool:
+        def matches(path_index: int, pattern_index: int) -> bool:
+            if pattern_index == len(pattern_parts):
+                return True
+
+            if path_index == len(target_parts):
+                return all(part == "**" for part in pattern_parts[pattern_index:])
+
+            pattern_part = pattern_parts[pattern_index]
+            if pattern_part == "**":
+                return matches(path_index, pattern_index + 1) or matches(
+                    path_index + 1, pattern_index
+                )
+
+            if not fnmatch.fnmatch(target_parts[path_index], pattern_part):
+                return False
+
+            return matches(path_index + 1, pattern_index + 1)
+
+        return matches(0, 0)
 
 
 # =============================================================================
@@ -287,11 +404,21 @@ def process_file(
 def scan_project(project_dir: str) -> list:
     """Return list of all readable file paths."""
     project_path = Path(project_dir).expanduser().resolve()
+    gitignore_matcher = GitignoreMatcher.from_project(project_path)
     files = []
     for root, dirs, filenames in os.walk(project_path):
+        root_path = Path(root)
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        if not gitignore_matcher.has_negations:
+            dirs[:] = [
+                d
+                for d in dirs
+                if not gitignore_matcher.matches(root_path / d, project_path, is_dir=True)
+            ]
         for filename in filenames:
-            filepath = Path(root) / filename
+            filepath = root_path / filename
+            if gitignore_matcher.matches(filepath, project_path, is_dir=False):
+                continue
             if filepath.suffix.lower() in READABLE_EXTENSIONS:
                 # Skip config files
                 if filename in (
